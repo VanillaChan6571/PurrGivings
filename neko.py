@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import re
 import sqlite3
 import os
+import json
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -18,9 +19,12 @@ class GiveawayBot(discord.Client):
         self.active_giveaways = {}
         self.conn = sqlite3.connect('giveaways.db')
         self.create_tables()
+        self.status_config = self.load_status_config()
+        self.last_giveaway_end_time = None
 
     async def setup_hook(self):
         await self.tree.sync()
+        self.bg_task = self.loop.create_task(self.update_status())
 
     def create_tables(self):
         cursor = self.conn.cursor()
@@ -43,6 +47,42 @@ class GiveawayBot(discord.Client):
         ''')
         self.conn.commit()
 
+    def load_status_config(self):
+        if os.path.exists('status.json'):
+            with open('status.json', 'r') as f:
+                return json.load(f)
+        else:
+            return {
+                "no_giveaways": [
+                    "Just Chilling like a cat",
+                    "Meowing at life",
+                    "Purrin Along.."
+                ],
+                "giveaway_active": [
+                    "I see the Nekos are Giving a wish!",
+                    "A Giveaway is in progress nya!",
+                    "Nya! Something is cooking!~"
+                ],
+                "giveaway_ended": [
+                    "Nya~! {username} won!",
+                    "OwO! {username} wish has been granted!",
+                    "Nekos has choosen {username}!"
+                ]
+            }
+
+    async def update_status(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            if self.active_giveaways:
+                status = random.choice(self.status_config["giveaway_active"])
+                await self.change_presence(activity=discord.Game(name=status), status=discord.Status.online)
+            elif self.last_giveaway_end_time and (datetime.utcnow() - self.last_giveaway_end_time) < timedelta(hours=48):
+                status = random.choice(self.status_config["giveaway_ended"]).format(username=self.last_winner)
+                await self.change_presence(activity=discord.Streaming(name=status, url="https://twitch.tv/vanillachanny"), status=discord.Status.streaming)
+            else:
+                status = random.choice(self.status_config["no_giveaways"])
+                await self.change_presence(activity=discord.Game(name=status), status=discord.Status.idle)
+            await asyncio.sleep(300)  # Update every 5 minutes
 
 bot = GiveawayBot()
 
@@ -186,8 +226,10 @@ async def end_giveaway(giveaway_id):
             winners = random.sample(participants, min(giveaway['winners'], len(participants)))
             winner_mentions = ', '.join(f"<@{winner}>" for winner in winners)
             await giveaway['message'].reply(f"Congratulations {winner_mentions}! You won the giveaway!")
+            bot.last_winner = bot.get_user(winners[0]).name if winners else "Unknown"
         else:
             await giveaway['message'].reply("No one entered the giveaway.")
+            bot.last_winner = "Nobody"
 
         # Archive the giveaway
         cursor.execute("SELECT * FROM giveaways WHERE id = ?", (giveaway_id,))
@@ -211,6 +253,9 @@ async def end_giveaway(giveaway_id):
 
         del bot.active_giveaways[giveaway_id]
 
+        if not bot.active_giveaways:
+            bot.last_giveaway_end_time = datetime.utcnow()
+
 
 @bot.event
 async def on_ready():
@@ -219,5 +264,22 @@ async def on_ready():
         os.makedirs('giveaways')
 
 
-# Replace 'YOUR_BOT_TOKEN' with your actual bot token
-bot.run('YOUR_BOT_TOKEN')
+def get_token():
+    config_file = 'bot-config.json'
+    if os.path.exists(config_file):
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+            return config.get('token')
+    else:
+        token = input("Please enter your Discord bot token: ").strip()
+        with open(config_file, 'w') as f:
+            json.dump({'token': token}, f)
+        print(f"Token saved to {config_file}")
+        return token
+
+
+if __name__ == "__main__":
+    token = get_token()
+    if not token:
+        raise ValueError("No token provided. Please run the script again and enter your bot token.")
+    bot.run(token)
