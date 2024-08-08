@@ -7,6 +7,7 @@ import re
 import sqlite3
 import os
 import json
+import sys
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -271,11 +272,20 @@ def get_token():
             config = json.load(f)
             return config.get('token')
     else:
-        token = input("Please enter your Discord bot token: ").strip()
-        with open(config_file, 'w') as f:
-            json.dump({'token': token}, f)
-        print(f"Token saved to {config_file}")
-        return token
+        while True:
+            # Use sys.stdout to ensure the prompt is immediately visible
+            sys.stdout.write("Please enter your Discord bot token: ")
+            sys.stdout.flush()
+            token = input().strip()
+
+            if len(token) < 50:
+                print(
+                    "Error: Token is too short. Discord bot tokens are usually 50+ characters long. Please try again.")
+            else:
+                with open(config_file, 'w') as f:
+                    json.dump({'token': token}, f)
+                print(f"Token saved to {config_file}")
+                return token
 
 
 if __name__ == "__main__":
