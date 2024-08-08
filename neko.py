@@ -8,10 +8,11 @@ import sqlite3
 import os
 import json
 import sys
+import pytz
+from datetime import datetime, timedelta
 
 intents = discord.Intents.default()
 intents.message_content = True
-
 
 class GiveawayBot(discord.Client):
     def __init__(self):
@@ -22,6 +23,7 @@ class GiveawayBot(discord.Client):
         self.create_tables()
         self.status_config = self.load_status_config()
         self.last_giveaway_end_time = None
+        self.last_winner = None
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -87,14 +89,12 @@ class GiveawayBot(discord.Client):
 
 bot = GiveawayBot()
 
-
 def generate_giveaway_id():
     year = datetime.now().year
     cursor = bot.conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM giveaways WHERE id LIKE ?", (f'%-{year}',))
     count = cursor.fetchone()[0] + 1
     return f'N{count:03d}-{year}'
-
 
 def parse_time(time_str):
     total_seconds = 0
@@ -105,7 +105,6 @@ def parse_time(time_str):
         total_seconds += int(value) * time_units[unit]
 
     return timedelta(seconds=total_seconds)
-
 
 class GiveawayView(discord.ui.View):
     def __init__(self, giveaway_id):
@@ -124,7 +123,6 @@ class GiveawayView(discord.ui.View):
         else:
             await interaction.response.send_message("You're already in the giveaway!", ephemeral=True)
 
-
 @bot.tree.command(name="create", description="Create a new giveaway")
 @app_commands.describe(
     title="Title of the giveaway",
@@ -141,15 +139,37 @@ async def create_giveaway(
         winners: int = 1,
         image: str = None
 ):
+    await interaction.response.defer(ephemeral=True)
+    await create_giveaway_task(bot, interaction, title, length, channel, winners, image)
+
+
+async def create_giveaway_task(bot, interaction, title, length, channel, winners, image):
     color_hex = "#3EB489"  # Mint green
     duration = parse_time(length)
-    end_time = datetime.utcnow() + duration
+    start_time = datetime.now(pytz.UTC)
+    end_time = start_time + duration
     giveaway_id = generate_giveaway_id()
+
+    # Convert to Unix timestamps
+    start_timestamp = int(start_time.timestamp())
+    end_timestamp = int(end_time.timestamp())
 
     embed = discord.Embed(title=title, description="React with 🎉 to enter!", color=int(color_hex.lstrip('#'), 16))
     embed.add_field(name="Giveaway ID", value=giveaway_id)
-    embed.add_field(name="End Time", value=f"<t:{int(end_time.timestamp())}:R>")
+    embed.add_field(name="Start Time", value=f"<t:{start_timestamp}:F>")
+    embed.add_field(name="End Time", value=f"<t:{end_timestamp}:F>")
+    embed.add_field(name="Duration", value=str(duration))
+    embed.add_field(name="Ends", value=f"<t:{end_timestamp}:R>")
     embed.add_field(name="Winners", value=str(winners))
+
+    # Add a field to show the time remaining in a user-friendly format
+    time_remaining = end_time - start_time
+    days, remainder = divmod(time_remaining.total_seconds(), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    time_str = f"{int(days)}d {int(hours)}h {int(minutes)}m {int(seconds)}s"
+    embed.add_field(name="Time Remaining", value=time_str)
+
     if image:
         embed.set_image(url=image)
 
@@ -170,11 +190,61 @@ async def create_giveaway(
         'view': view
     }
 
-    await interaction.response.send_message(f"Giveaway {giveaway_id} created in {channel.mention}!", ephemeral=True)
+    await interaction.followup.send(f"Giveaway {giveaway_id} created in {channel.mention}!", ephemeral=True)
 
+    # Schedule the giveaway to end
+    bot.loop.create_task(schedule_giveaway_end(giveaway_id, duration))
+async def schedule_giveaway_end(giveaway_id, duration):
+    print(f"Debug: Scheduling giveaway end for {giveaway_id}")
+    print(f"Debug: Duration: {duration}")
     await asyncio.sleep(duration.total_seconds())
+    print(f"Debug: Ending giveaway {giveaway_id}")
     await end_giveaway(giveaway_id)
 
+async def end_giveaway(giveaway_id):
+    if giveaway_id in bot.active_giveaways:
+        giveaway = bot.active_giveaways[giveaway_id]
+        cursor = bot.conn.cursor()
+        cursor.execute("SELECT user_id FROM participants WHERE giveaway_id = ?", (giveaway_id,))
+        participants = [row[0] for row in cursor.fetchall()]
+
+        if participants:
+            winners = random.sample(participants, min(giveaway['winners'], len(participants)))
+            winner_mentions = ', '.join(f"<@{winner}>" for winner in winners)
+            await giveaway['message'].reply(f"Congratulations {winner_mentions}! You won the giveaway!")
+            bot.last_winner = bot.get_user(winners[0]).name if winners else "Unknown"
+        else:
+            await giveaway['message'].reply("No one entered the giveaway.")
+            bot.last_winner = "Nobody"
+
+        # Archive the giveaway
+        cursor.execute("SELECT * FROM giveaways WHERE id = ?", (giveaway_id,))
+        giveaway_data = cursor.fetchone()
+        if giveaway_data:
+            with open(f"giveaways/{giveaway_id}.txt", "w") as f:
+                f.write(f"Giveaway ID: {giveaway_id}\n")
+                f.write(f"Title: {giveaway_data[1]}\n")
+                f.write(f"Channel ID: {giveaway_data[2]}\n")
+                f.write(f"End Time: {giveaway_data[3]}\n")
+                f.write(f"Winners: {giveaway_data[4]}\n")
+                f.write(f"Image: {giveaway_data[5]}\n")
+                f.write("Participants:\n")
+                for participant in participants:
+                    f.write(f"- {participant}\n")
+                f.write(f"Winners: {', '.join(map(str, winners))}\n")
+
+        # Remove the giveaway from the database
+        cursor.execute("DELETE FROM giveaways WHERE id = ?", (giveaway_id,))
+        cursor.execute("DELETE FROM participants WHERE giveaway_id = ?", (giveaway_id,))
+        bot.conn.commit()
+
+        del bot.active_giveaways[giveaway_id]
+
+        if not bot.active_giveaways:
+            bot.last_giveaway_end_time = datetime.utcnow()
+
+    else:
+        print(f"Warning: Attempted to end non-existent giveaway with ID {giveaway_id}")
 
 @bot.tree.command(name="giveaway-view", description="View participants of a giveaway")
 @app_commands.describe(giveaway_id="ID of the giveaway to view")
@@ -198,7 +268,6 @@ async def view_giveaway(interaction: discord.Interaction, giveaway_id: str):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
 @bot.tree.command(name="giveaway-list", description="List all giveaways")
 async def list_giveaways(interaction: discord.Interaction):
     cursor = bot.conn.cursor()
@@ -215,55 +284,11 @@ async def list_giveaways(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
-async def end_giveaway(giveaway_id):
-    if giveaway_id in bot.active_giveaways:
-        giveaway = bot.active_giveaways[giveaway_id]
-        cursor = bot.conn.cursor()
-        cursor.execute("SELECT user_id FROM participants WHERE giveaway_id = ?", (giveaway_id,))
-        participants = [row[0] for row in cursor.fetchall()]
-
-        if participants:
-            winners = random.sample(participants, min(giveaway['winners'], len(participants)))
-            winner_mentions = ', '.join(f"<@{winner}>" for winner in winners)
-            await giveaway['message'].reply(f"Congratulations {winner_mentions}! You won the giveaway!")
-            bot.last_winner = bot.get_user(winners[0]).name if winners else "Unknown"
-        else:
-            await giveaway['message'].reply("No one entered the giveaway.")
-            bot.last_winner = "Nobody"
-
-        # Archive the giveaway
-        cursor.execute("SELECT * FROM giveaways WHERE id = ?", (giveaway_id,))
-        giveaway_data = cursor.fetchone()
-        with open(f"giveaways/{giveaway_id}.txt", "w") as f:
-            f.write(f"Giveaway ID: {giveaway_id}\n")
-            f.write(f"Title: {giveaway_data[1]}\n")
-            f.write(f"Channel ID: {giveaway_data[2]}\n")
-            f.write(f"End Time: {giveaway_data[3]}\n")
-            f.write(f"Winners: {giveaway_data[4]}\n")
-            f.write(f"Image: {giveaway_data[5]}\n")
-            f.write("Participants:\n")
-            for participant in participants:
-                f.write(f"- {participant}\n")
-            f.write(f"Winners: {', '.join(map(str, winners))}\n")
-
-        # Remove the giveaway from the database
-        cursor.execute("DELETE FROM giveaways WHERE id = ?", (giveaway_id,))
-        cursor.execute("DELETE FROM participants WHERE giveaway_id = ?", (giveaway_id,))
-        bot.conn.commit()
-
-        del bot.active_giveaways[giveaway_id]
-
-        if not bot.active_giveaways:
-            bot.last_giveaway_end_time = datetime.utcnow()
-
-
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
     if not os.path.exists('giveaways'):
         os.makedirs('giveaways')
-
 
 def get_token():
     config_file = 'bot-config.json'
@@ -273,20 +298,17 @@ def get_token():
             return config.get('token')
     else:
         while True:
-            # Use sys.stdout to ensure the prompt is immediately visible
             sys.stdout.write("Please enter your Discord bot token: ")
             sys.stdout.flush()
             token = input().strip()
 
             if len(token) < 50:
-                print(
-                    "Error: Token is too short. Discord bot tokens are usually 50+ characters long. Please try again.")
+                print("Error: Token is too short. Discord bot tokens are usually 50+ characters long. Please try again.")
             else:
                 with open(config_file, 'w') as f:
                     json.dump({'token': token}, f)
                 print(f"Token saved to {config_file}")
                 return token
-
 
 if __name__ == "__main__":
     token = get_token()
