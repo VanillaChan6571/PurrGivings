@@ -2,7 +2,6 @@ import discord
 from discord import app_commands
 import random
 import asyncio
-from datetime import datetime, timedelta
 import re
 import sqlite3
 import os
@@ -10,6 +9,16 @@ import json
 import sys
 import pytz
 from datetime import datetime, timedelta
+import logging
+from aiohttp import web
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('discord')
+logger.setLevel(logging.DEBUG)
+handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
+handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s'))
+logger.addHandler(handler)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -24,6 +33,17 @@ class GiveawayBot(discord.Client):
         self.status_config = self.load_status_config()
         self.last_giveaway_end_time = None
         self.last_winner = None
+
+        async def on_ready(self):
+            logger.info(f'{self.user} has connected to Discord!')
+            if not os.path.exists('giveaways'):
+                os.makedirs('giveaways')
+
+        async def on_disconnect(self):
+            logger.warning('Bot disconnected from Discord')
+
+        async def on_resume(self):
+            logger.info('Bot resumed connection to Discord')
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -69,7 +89,7 @@ class GiveawayBot(discord.Client):
                 "giveaway_ended": [
                     "Nya~! {username} won!",
                     "OwO! {username} wish has been granted!",
-                    "Nekos has choosen {username}!"
+                    "Nekos has chosen {username}!"
                 ]
             }
 
@@ -310,8 +330,28 @@ def get_token():
                 print(f"Token saved to {config_file}")
                 return token
 
+# Keep-alive web server
+async def keep_alive(request):
+    return web.Response(text="I'm alive!")
+
+app = web.Application()
+app.router.add_get("/", keep_alive)
+runner = web.AppRunner(app)
+
 if __name__ == "__main__":
     token = get_token()
     if not token:
         raise ValueError("No token provided. Please run the script again and enter your bot token.")
     bot.run(token)
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(runner.setup())
+    site = web.TCPSite(runner, 'localhost', 8080)
+    loop.run_until_complete(site.start())
+
+    try:
+        loop.run_until_complete(bot.start(token))
+    except KeyboardInterrupt:
+        loop.run_until_complete(bot.close())
+    finally:
+        loop.run_until_complete(runner.cleanup())
