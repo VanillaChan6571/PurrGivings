@@ -11,6 +11,7 @@ import pytz
 from datetime import datetime, timedelta
 import logging
 from aiohttp import web
+from discord.ext import tasks
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -33,21 +34,18 @@ class GiveawayBot(discord.Client):
         self.status_config = self.load_status_config()
         self.last_giveaway_end_time = None
         self.last_winner = None
+        self.update_interval = 15 * 60  # 15 minutes in seconds
 
-        async def on_ready(self):
-            logger.info(f'{self.user} has connected to Discord!')
-            if not os.path.exists('giveaways'):
-                os.makedirs('giveaways')
+    async def on_ready(self):
+        logger.info(f'{self.user} has connected to Discord!')
+        if not os.path.exists('giveaways'):
+            os.makedirs('giveaways')
 
-        async def on_disconnect(self):
-            logger.warning('Bot disconnected from Discord')
+    async def on_disconnect(self):
+        logger.warning('Bot disconnected from Discord')
 
-        async def on_resume(self):
-            logger.info('Bot resumed connection to Discord')
-
-    async def setup_hook(self):
-        await self.tree.sync()
-        self.bg_task = self.loop.create_task(self.update_status())
+    async def on_resume(self):
+        logger.info('Bot resumed connection to Discord')
 
     def create_tables(self):
         cursor = self.conn.cursor()
@@ -93,19 +91,92 @@ class GiveawayBot(discord.Client):
                 ]
             }
 
-    async def update_status(self):
+    async def setup_hook(self):
+        await self.tree.sync()
+        self.bg_task = self.loop.create_task(self.update_status_loop())
+
+    async def update_status_loop(self):
         await self.wait_until_ready()
         while not self.is_closed():
+            await self.update_status()
+            if self.active_giveaways:
+                await asyncio.sleep(5 * 60)  # Update every 5 minutes if a giveaway is active
+            else:
+                await asyncio.sleep(self.update_interval)
+
+    async def update_status(self):
+        try:
+            logger.debug(f"Updating status. Active giveaways: {bool(self.active_giveaways)}")
+            logger.debug(f"Last giveaway end time: {self.last_giveaway_end_time}")
+            logger.debug(f"Last winner: {self.last_winner}")
+
             if self.active_giveaways:
                 status = random.choice(self.status_config["giveaway_active"])
+                logger.info(f"Setting status to: {status} (online)")
                 await self.change_presence(activity=discord.Game(name=status), status=discord.Status.online)
-            elif self.last_giveaway_end_time and (datetime.utcnow() - self.last_giveaway_end_time) < timedelta(hours=48):
+            elif self.last_giveaway_end_time and (datetime.utcnow() - self.last_giveaway_end_time) < timedelta(
+                    hours=48):
                 status = random.choice(self.status_config["giveaway_ended"]).format(username=self.last_winner)
-                await self.change_presence(activity=discord.Streaming(name=status, url="https://twitch.tv/vanillachanny"), status=discord.Status.streaming)
+                logger.info(f"Setting status to: {status} (streaming)")
+                await self.change_presence(
+                    activity=discord.Streaming(name=status, url="https://twitch.tv/vanillachanny"),
+                    status=discord.Status.online)
             else:
                 status = random.choice(self.status_config["no_giveaways"])
+                logger.info(f"Setting status to: {status} (idle)")
                 await self.change_presence(activity=discord.Game(name=status), status=discord.Status.idle)
-            await asyncio.sleep(300)  # Update every 5 minutes
+        except discord.errors.HTTPException as e:
+            logger.error(f"Failed to update presence: {e}")
+
+    @discord.app_commands.command(name="set_status", description="Manually set the bot's status")
+    @discord.app_commands.checks.has_permissions(administrator=True)
+    async def set_status(self, interaction: discord.Interaction, status_type: str):
+        if status_type not in self.status_config:
+            await interaction.response.send_message(f"Invalid status type. Choose from: {', '.join(self.status_config.keys())}", ephemeral=True)
+            return
+
+        await self.update_status()
+        await interaction.response.send_message(f"Status updated to '{status_type}' type.", ephemeral=True)
+
+    @tasks.loop(minutes=1)
+    async def update_time_remaining(self, giveaway_id, message, end_time):
+        try:
+            if giveaway_id not in self.active_giveaways:
+                self.update_time_remaining.cancel()
+                return
+
+            now = datetime.now(pytz.UTC)
+            time_remaining = end_time - now
+
+            if time_remaining.total_seconds() <= 0:
+                embed = message.embeds[0]
+                status_field = next((field for field in embed.fields if field.name == "Status"), None)
+                if not status_field:
+                    embed.add_field(name="Status", value="ENDED", inline=False)
+                for i, field in enumerate(embed.fields):
+                    if field.name == "Time Remaining":
+                        embed.set_field_at(i, name="Time Remaining", value="ENDED")
+                        break
+                await message.edit(embed=embed, view=None)  # Remove the button
+                await end_giveaway(giveaway_id)
+                self.update_time_remaining.cancel()
+                return
+
+            days, remainder = divmod(time_remaining.total_seconds(), 86400)
+            hours, remainder = divmod(remainder, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            time_str = f"{int(days)}d {int(hours)}h {int(minutes)}m {int(seconds)}s"
+
+            embed = message.embeds[0]
+            for i, field in enumerate(embed.fields):
+                if field.name == "Time Remaining":
+                    embed.set_field_at(i, name="Time Remaining", value=time_str)
+                    break
+
+            await message.edit(embed=embed)
+        except Exception as e:
+            logger.error(f"Error in update_time_remaining for giveaway {giveaway_id}: {str(e)}")
+            self.update_time_remaining.cancel()
 
 bot = GiveawayBot()
 
@@ -131,7 +202,7 @@ class GiveawayView(discord.ui.View):
         super().__init__(timeout=None)
         self.giveaway_id = giveaway_id
 
-    @discord.ui.button(label="Enter Giveaway", style=discord.ButtonStyle.primary, emoji="🎉")
+    @discord.ui.button(label="Pray for Gods of Nekos", style=discord.ButtonStyle.primary, emoji="<:Peek:1222014873735790644>")
     async def enter_giveaway(self, interaction: discord.Interaction, button: discord.ui.Button):
         user_id = interaction.user.id
         cursor = bot.conn.cursor()
@@ -162,7 +233,6 @@ async def create_giveaway(
     await interaction.response.defer(ephemeral=True)
     await create_giveaway_task(bot, interaction, title, length, channel, winners, image)
 
-
 async def create_giveaway_task(bot, interaction, title, length, channel, winners, image):
     color_hex = "#3EB489"  # Mint green
     duration = parse_time(length)
@@ -174,21 +244,14 @@ async def create_giveaway_task(bot, interaction, title, length, channel, winners
     start_timestamp = int(start_time.timestamp())
     end_timestamp = int(end_time.timestamp())
 
-    embed = discord.Embed(title=title, description="React with 🎉 to enter!", color=int(color_hex.lstrip('#'), 16))
+    embed = discord.Embed(title=title, description="Pray for Gods of Nekos", color=int(color_hex.lstrip('#'), 16))
     embed.add_field(name="Giveaway ID", value=giveaway_id)
     embed.add_field(name="Start Time", value=f"<t:{start_timestamp}:F>")
     embed.add_field(name="End Time", value=f"<t:{end_timestamp}:F>")
     embed.add_field(name="Duration", value=str(duration))
     embed.add_field(name="Ends", value=f"<t:{end_timestamp}:R>")
-    embed.add_field(name="Winners", value=str(winners))
-
-    # Add a field to show the time remaining in a user-friendly format
-    time_remaining = end_time - start_time
-    days, remainder = divmod(time_remaining.total_seconds(), 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    time_str = f"{int(days)}d {int(hours)}h {int(minutes)}m {int(seconds)}s"
-    embed.add_field(name="Time Remaining", value=time_str)
+    embed.add_field(name="How Many Can Win?", value=str(winners))
+    embed.add_field(name="Time Remaining", value="Calculating...")
 
     if image:
         embed.set_image(url=image)
@@ -212,14 +275,12 @@ async def create_giveaway_task(bot, interaction, title, length, channel, winners
 
     await interaction.followup.send(f"Giveaway {giveaway_id} created in {channel.mention}!", ephemeral=True)
 
-    # Schedule the giveaway to end
-    bot.loop.create_task(schedule_giveaway_end(giveaway_id, duration))
-async def schedule_giveaway_end(giveaway_id, duration):
-    print(f"Debug: Scheduling giveaway end for {giveaway_id}")
-    print(f"Debug: Duration: {duration}")
-    await asyncio.sleep(duration.total_seconds())
-    print(f"Debug: Ending giveaway {giveaway_id}")
-    await end_giveaway(giveaway_id)
+    # Update the bot's status when a giveaway starts
+    await bot.update_status()
+
+    # Start the background task to update the time remaining
+    bot.update_time_remaining.start(giveaway_id, message, end_time)
+
 
 async def end_giveaway(giveaway_id):
     if giveaway_id in bot.active_giveaways:
@@ -232,10 +293,26 @@ async def end_giveaway(giveaway_id):
             winners = random.sample(participants, min(giveaway['winners'], len(participants)))
             winner_mentions = ', '.join(f"<@{winner}>" for winner in winners)
             await giveaway['message'].reply(f"Congratulations {winner_mentions}! You won the giveaway!")
-            bot.last_winner = bot.get_user(winners[0]).name if winners else "Unknown"
+
+            winner_user = bot.get_user(winners[0])
+            if winner_user:
+                bot.last_winner = winner_user.name
+            else:
+                bot.last_winner = f"Unknown (ID: {winners[0]})"
         else:
             await giveaway['message'].reply("No one entered the giveaway.")
             bot.last_winner = "Nobody"
+
+        # Update the giveaway message
+        embed = giveaway['message'].embeds[0]
+        status_field = next((field for field in embed.fields if field.name == "Status"), None)
+        if not status_field:
+            embed.add_field(name="Status", value="ENDED", inline=False)
+        for i, field in enumerate(embed.fields):
+            if field.name == "Time Remaining" and field.value != "ENDED":
+                embed.set_field_at(i, name="Time Remaining", value="ENDED")
+                break
+        await giveaway['message'].edit(embed=embed, view=None)  # Remove the button
 
         # Archive the giveaway
         cursor.execute("SELECT * FROM giveaways WHERE id = ?", (giveaway_id,))
@@ -260,8 +337,11 @@ async def end_giveaway(giveaway_id):
 
         del bot.active_giveaways[giveaway_id]
 
+        bot.last_giveaway_end_time = datetime.utcnow()
+
+        # Update the bot's status when a giveaway ends, but only if there are no more active giveaways
         if not bot.active_giveaways:
-            bot.last_giveaway_end_time = datetime.utcnow()
+            await bot.update_status()
 
     else:
         print(f"Warning: Attempted to end non-existent giveaway with ID {giveaway_id}")
@@ -304,12 +384,6 @@ async def list_giveaways(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.event
-async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
-    if not os.path.exists('giveaways'):
-        os.makedirs('giveaways')
-
 def get_token():
     config_file = 'bot-config.json'
     if os.path.exists(config_file):
@@ -330,28 +404,31 @@ def get_token():
                 print(f"Token saved to {config_file}")
                 return token
 
-# Keep-alive web server
 async def keep_alive(request):
     return web.Response(text="I'm alive!")
 
-app = web.Application()
-app.router.add_get("/", keep_alive)
-runner = web.AppRunner(app)
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", keep_alive)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, 'localhost', 8080)
+    await site.start()
+    return runner
 
-if __name__ == "__main__":
+async def main():
     token = get_token()
     if not token:
         raise ValueError("No token provided. Please run the script again and enter your bot token.")
-    bot.run(token)
 
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(runner.setup())
-    site = web.TCPSite(runner, 'localhost', 8080)
-    loop.run_until_complete(site.start())
+    web_runner = await start_web_server()
 
     try:
-        loop.run_until_complete(bot.start(token))
+        await bot.start(token)
     except KeyboardInterrupt:
-        loop.run_until_complete(bot.close())
+        await bot.close()
     finally:
-        loop.run_until_complete(runner.cleanup())
+        await web_runner.cleanup()
+
+if __name__ == "__main__":
+    asyncio.run(main())
