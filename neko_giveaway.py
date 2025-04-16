@@ -249,7 +249,7 @@ class GiveawayView(discord.ui.View):
         self.giveaway_id = giveaway_id
         self.cog = cog
 
-    @discord.ui.button(label="Enter Giveaway", style=discord.ButtonStyle.primary, emoji="🎉", custom_id="enter_giveaway")
+    @discord.ui.button(label="Pray for Gods of Nekos", style=discord.ButtonStyle.primary, emoji="<:Peek:1222014873735790644>", custom_id="enter_giveaway")
     async def enter_giveaway(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Get the cog if it's not set (for persistent views)
         if self.cog is None:
