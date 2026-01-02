@@ -9,7 +9,7 @@ import random
 from neko_database import get_participants, add_participant, get_giveaway, add_giveaway, delete_giveaway
 from neko_utils import parse_time, generate_giveaway_id, format_time_remaining
 
-logger = logging.getLogger('neko.giveaway')
+logger = logging.getLogger('giveaway')
 
 
 class GiveawayCog(commands.Cog):
@@ -18,6 +18,9 @@ class GiveawayCog(commands.Cog):
         self.active_giveaways = {}
 
     async def cog_load(self):
+        # Reload giveaways immediately on startup
+        await self.reload_active_giveaways()
+        # Then start the periodic reload task
         self.reload_active_giveaways.start()
 
     @tasks.loop(minutes=1)
@@ -31,24 +34,20 @@ class GiveawayCog(commands.Cog):
             time_remaining = end_time - now
 
             if time_remaining.total_seconds() <= 0:
-                embed = message.embeds[0]
-                embed.add_field(name="Status", value="ENDED", inline=False)
-                for i, field in enumerate(embed.fields):
-                    if field.name == "Time Remaining":
-                        embed.set_field_at(i, name="Time Remaining", value="ENDED")
-                        break
-                await message.edit(embed=embed, view=None)  # Remove the button
+                # Don't add Status here - end_giveaway will handle it
                 await self.end_giveaway(giveaway_id)
                 self.update_time_remaining.cancel()
                 return
 
             time_str = format_time_remaining(time_remaining)
+            participant_count = len(get_participants(self.bot.conn, giveaway_id))
 
             embed = message.embeds[0]
             for i, field in enumerate(embed.fields):
                 if field.name == "Time Remaining":
                     embed.set_field_at(i, name="Time Remaining", value=time_str)
-                    break
+                elif field.name == "Participants":
+                    embed.set_field_at(i, name="Participants", value=str(participant_count))
 
             await message.edit(embed=embed)
         except Exception as e:
@@ -57,34 +56,54 @@ class GiveawayCog(commands.Cog):
 
     @tasks.loop(minutes=5)
     async def reload_active_giveaways(self):
-        logger.info("Reloading active giveaways")
-        cursor = self.bot.conn.cursor()
-        cursor.execute("SELECT id, channel_id, end_time, winners FROM giveaways WHERE end_time > ?",
-                       (datetime.now(pytz.UTC).isoformat(),))
-        active_giveaways = cursor.fetchall()
+        try:
+            logger.info("Reloading active giveaways")
+            cursor = self.bot.conn.cursor()
+            cursor.execute("SELECT id, message_id, channel_id, end_time, winners FROM giveaways WHERE end_time > ?",
+                           (datetime.now(pytz.UTC).isoformat(),))
+            active_giveaways = cursor.fetchall()
 
-        for giveaway in active_giveaways:
-            giveaway_id, channel_id, end_time, winners = giveaway
-            channel = self.bot.get_channel(channel_id)
-            if channel:
-                try:
-                    message = await channel.fetch_message(int(giveaway_id))
-                    end_time = datetime.fromisoformat(end_time)
-                    view = GiveawayView(giveaway_id, self)
-                    self.active_giveaways[giveaway_id] = {
-                        'message': message,
-                        'end_time': end_time,
-                        'winners': winners,
-                        'view': view
-                    }
-                    self.update_time_remaining.start(giveaway_id, message, end_time)
-                    logger.info(f"Reloaded giveaway: {giveaway_id}")
-                except discord.errors.NotFound:
-                    logger.warning(f"Could not find message for giveaway {giveaway_id}. Removing from database.")
+            for giveaway in active_giveaways:
+                giveaway_id, message_id, channel_id, end_time, winners = giveaway
+
+                # Skip if already loaded and active
+                if giveaway_id in self.active_giveaways:
+                    logger.debug(f"Giveaway {giveaway_id} already active, skipping reload")
+                    continue
+
+                channel = self.bot.get_channel(channel_id)
+                if channel:
+                    try:
+                        message = await channel.fetch_message(message_id)
+                        end_time = datetime.fromisoformat(end_time)
+                        view = GiveawayView(giveaway_id, self)
+                        self.active_giveaways[giveaway_id] = {
+                            'message': message,
+                            'end_time': end_time,
+                            'winners': winners,
+                            'view': view
+                        }
+                        self.update_time_remaining.start(giveaway_id, message, end_time)
+                        logger.info(f"Reloaded giveaway: {giveaway_id}")
+                    except discord.errors.NotFound:
+                        logger.warning(f"Message for giveaway {giveaway_id} was deleted. Ending giveaway early.")
+                        # End the giveaway without a message reference
+                        await self.end_giveaway_deleted_message(giveaway_id, channel)
+                    except Exception as e:
+                        logger.error(f"Error reloading giveaway {giveaway_id}: {e}", exc_info=True)
+                else:
+                    logger.warning(f"Could not find channel for giveaway {giveaway_id}. Removing from database.")
                     delete_giveaway(self.bot.conn, giveaway_id)
-            else:
-                logger.warning(f"Could not find channel for giveaway {giveaway_id}. Removing from database.")
-                delete_giveaway(self.bot.conn, giveaway_id)
+
+            logger.info(f"Reload complete. Active giveaways: {len(self.active_giveaways)}")
+        except Exception as e:
+            logger.error(f"Critical error in reload_active_giveaways: {e}", exc_info=True)
+
+    @reload_active_giveaways.before_loop
+    async def before_reload_active_giveaways(self):
+        """Wait for bot to be ready before starting the reload loop."""
+        await self.bot.wait_until_ready()
+        logger.info("Bot is ready, reload task will start")
 
     @app_commands.command(name="create", description="Create a new giveaway")
     @app_commands.describe(
@@ -155,6 +174,7 @@ class GiveawayCog(commands.Cog):
         embed.add_field(name="Duration", value=str(duration))
         embed.add_field(name="Ends", value=f"<t:{end_timestamp}:R>")
         embed.add_field(name="Winners", value=str(winners))
+        embed.add_field(name="Participants", value="0")
         embed.add_field(name="Time Remaining", value="Calculating...")
 
         if image:
@@ -163,7 +183,8 @@ class GiveawayCog(commands.Cog):
         view = GiveawayView(giveaway_id, self)
         message = await channel.send(embed=embed, view=view)
 
-        add_giveaway(self.bot.conn, giveaway_id, title, channel.id, end_time, winners, image)
+        # Store both human-readable ID and message ID
+        add_giveaway(self.bot.conn, giveaway_id, message.id, title, channel.id, end_time, winners, image)
 
         self.active_giveaways[giveaway_id] = {
             'message': message,
@@ -182,6 +203,58 @@ class GiveawayCog(commands.Cog):
 
         # Start the background task to update the time remaining
         self.update_time_remaining.start(giveaway_id, message, end_time)
+
+    async def end_giveaway_deleted_message(self, giveaway_id, channel):
+        """Handle ending a giveaway when the original message was deleted."""
+        logger.info(f"Ending giveaway with deleted message: {giveaway_id}")
+        giveaway_data = get_giveaway(self.bot.conn, giveaway_id)
+        if not giveaway_data:
+            return
+
+        _, title, _, _, winners_count, _ = giveaway_data
+        participants = get_participants(self.bot.conn, giveaway_id)
+
+        embed = discord.Embed(
+            title=f"Giveaway Ended: {title}",
+            description="The original giveaway message was deleted, but here are the results!",
+            color=int("#3EB489".lstrip('#'), 16)
+        )
+
+        if participants:
+            winners = random.sample(participants, min(winners_count, len(participants)))
+            winner_mentions = ', '.join(f"<@{winner}>" for winner in winners)
+            embed.add_field(name="Winners", value=winner_mentions, inline=False)
+            embed.add_field(name="Total Participants", value=str(len(participants)), inline=False)
+
+            await channel.send(f"**Giveaway Results** (Message was deleted)\n{winner_mentions}", embed=embed)
+
+            winner_user = self.bot.get_user(winners[0])
+            winner_name = winner_user.name if winner_user else f"Unknown (ID: {winners[0]})"
+        else:
+            embed.add_field(name="Result", value="No one entered the giveaway.", inline=False)
+            await channel.send(embed=embed)
+            winner_name = "Nobody"
+
+        # Archive the giveaway with a note about deletion
+        with open(f"giveaways/{giveaway_id}.txt", "w") as f:
+            f.write(f"Giveaway ID: {giveaway_id}\n")
+            f.write(f"Title: {title}\n")
+            f.write(f"Channel ID: {channel.id}\n")
+            f.write(f"Status: MESSAGE DELETED\n")
+            f.write(f"Winners Requested: {winners_count}\n")
+            f.write("Participants:\n")
+            for participant in participants:
+                f.write(f"- {participant}\n")
+            if participants:
+                f.write(f"Winners: {', '.join(map(str, winners))}\n")
+
+        # Clean up database
+        delete_giveaway(self.bot.conn, giveaway_id)
+
+        # Update status
+        if self.bot.status_manager:
+            self.bot.status_manager.set_last_giveaway_info(datetime.utcnow(), winner_name)
+            await self.bot.status_manager.update_status()
 
     async def end_giveaway(self, giveaway_id):
         logger.info(f"Ending giveaway: {giveaway_id}")
@@ -205,11 +278,20 @@ class GiveawayCog(commands.Cog):
 
             # Update the giveaway message
             embed = giveaway['message'].embeds[0]
-            embed.add_field(name="Status", value="ENDED", inline=False)
+
+            # Check if Status field already exists
+            status_exists = any(field.name == "Status" for field in embed.fields)
+
+            if not status_exists:
+                embed.add_field(name="Status", value="ENDED", inline=False)
+
+            # Update Time Remaining and ensure it's marked as ended
             for i, field in enumerate(embed.fields):
                 if field.name == "Time Remaining" and field.value != "ENDED":
                     embed.set_field_at(i, name="Time Remaining", value="ENDED")
-                    break
+                elif field.name == "Status":
+                    embed.set_field_at(i, name="Status", value="ENDED", inline=False)
+
             await giveaway['message'].edit(embed=embed, view=None)  # Remove the button
 
             # Archive the giveaway
@@ -249,7 +331,7 @@ class GiveawayView(discord.ui.View):
         self.giveaway_id = giveaway_id
         self.cog = cog
 
-    @discord.ui.button(label="Pray for Gods of Nekos", style=discord.ButtonStyle.primary, emoji="<:Peek:1222014873735790644>", custom_id="enter_giveaway")
+    @discord.ui.button(label="Pray for Gods of Nekos", style=discord.ButtonStyle.primary, emoji=discord.PartialEmoji(name="Peek", id=1222014873735790644), custom_id="enter_giveaway")
     async def enter_giveaway(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Get the cog if it's not set (for persistent views)
         if self.cog is None:

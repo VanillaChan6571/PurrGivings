@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import logging
 import asyncio
 
-logger = logging.getLogger('neko.status')
+logger = logging.getLogger('status')
 
 
 class StatusManager:

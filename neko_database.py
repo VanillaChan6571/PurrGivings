@@ -23,6 +23,7 @@ def create_tables(conn):
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS giveaways (
             id TEXT PRIMARY KEY,
+            message_id INTEGER NOT NULL,
             title TEXT NOT NULL,
             channel_id INTEGER NOT NULL,
             end_time TEXT NOT NULL,
@@ -30,6 +31,15 @@ def create_tables(conn):
             image TEXT
         )
         ''')
+
+        # Add message_id column to existing tables (migration)
+        try:
+            cursor.execute("ALTER TABLE giveaways ADD COLUMN message_id INTEGER")
+            conn.commit()
+            logger.info("Added message_id column to giveaways table")
+        except sqlite3.Error:
+            # Column already exists, ignore
+            pass
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS participants (
             giveaway_id TEXT,
@@ -43,14 +53,14 @@ def create_tables(conn):
         logger.error(f"Error creating tables: {e}")
 
 
-def add_giveaway(conn, giveaway_id, title, channel_id, end_time, winners, image=None):
+def add_giveaway(conn, giveaway_id, message_id, title, channel_id, end_time, winners, image=None):
     """Add a new giveaway to the database."""
     try:
         cursor = conn.cursor()
         cursor.execute('''
-        INSERT INTO giveaways (id, title, channel_id, end_time, winners, image)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ''', (giveaway_id, title, channel_id, end_time.isoformat(), winners, image))
+        INSERT INTO giveaways (id, message_id, title, channel_id, end_time, winners, image)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (giveaway_id, message_id, title, channel_id, end_time.isoformat(), winners, image))
         conn.commit()
     except sqlite3.Error as e:
         logger.error(f"Error adding giveaway: {e}")

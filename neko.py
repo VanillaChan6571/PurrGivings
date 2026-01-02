@@ -6,10 +6,65 @@ from neko_giveaway import GiveawayCog
 from neko_database import create_connection, create_tables
 from neko_utils import get_token
 from neko_status import StatusManager
+from colorama import Fore, Back, Style, init
 
-# Set up logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
+# Initialize colorama for cross-platform color support
+init(autoreset=True)
+
+# Custom colored formatter
+class ColoredFormatter(logging.Formatter):
+    """Custom formatter with colors for different log levels."""
+
+    COLORS = {
+        'DEBUG': Fore.CYAN,
+        'INFO': Fore.GREEN,
+        'WARNING': Fore.YELLOW,
+        'ERROR': Fore.RED,
+        'CRITICAL': Fore.RED + Back.WHITE + Style.BRIGHT,
+    }
+
+    ICONS = {
+        'DEBUG': '🔍',
+        'INFO': '✅',
+        'WARNING': '⚠️',
+        'ERROR': '❌',
+        'CRITICAL': '🚨',
+    }
+
+    def format(self, record):
+        # Color the level name
+        levelname = record.levelname
+        if levelname in self.COLORS:
+            record.levelname = f"{self.COLORS[levelname]}{self.ICONS.get(levelname, '')} {levelname}{Style.RESET_ALL}"
+
+        # Color the logger name
+        record.name = f"{Fore.MAGENTA}{record.name}{Style.RESET_ALL}"
+
+        # Color timestamps
+        if hasattr(record, 'asctime'):
+            record.asctime = f"{Fore.BLUE}{record.asctime}{Style.RESET_ALL}"
+
+        return super().format(record)
+
+# Set up logging with colors
+handler = logging.StreamHandler()
+handler.setFormatter(ColoredFormatter('%(asctime)s │ %(levelname)s │ %(name)s │ %(message)s', datefmt='%H:%M:%S'))
+
+# Configure root logger
+logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+# Set discord.py logging to WARNING to reduce noise
+logging.getLogger('discord').setLevel(logging.WARNING)
+logging.getLogger('discord.http').setLevel(logging.WARNING)
+logging.getLogger('discord.gateway').setLevel(logging.WARNING)
+
 logger = logging.getLogger('neko')
+logger.setLevel(logging.INFO)
+
+# Print startup banner
+print(f"\n{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+print(f"{Fore.GREEN}{Style.BRIGHT}           🐱 PurrGivings Bot Starting... 🎁{Style.RESET_ALL}")
+print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
 
 
 class NekoBot(commands.Bot):
@@ -29,7 +84,13 @@ class NekoBot(commands.Bot):
         logger.info("Bot setup completed")
 
     async def on_ready(self):
-        logger.info(f'Logged in as {self.user} (ID: {self.user.id})')
+        print(f"\n{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{Style.BRIGHT}✨ Bot Connected Successfully!{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}   Username: {Fore.WHITE}{self.user}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}   User ID:  {Fore.WHITE}{self.user.id}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}   Servers:  {Fore.WHITE}{len(self.guilds)}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}\n")
+        logger.info(f'Ready! Logged in as {self.user} (ID: {self.user.id})')
         self.loop.create_task(self.status_manager.start_status_loop())
 
 
